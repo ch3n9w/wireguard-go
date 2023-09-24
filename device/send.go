@@ -8,9 +8,12 @@ package device
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"net"
+	"net/netip"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -204,6 +207,64 @@ func (peer *Peer) keepKeyFreshSending() {
 	}
 }
 
+// 计算TCP伪头部的校验和
+func pseudoHeaderChecksum(srcIP, dstIP net.IP, tcpLen uint16) uint16 {
+	sum := 0
+
+	// 添加源IP和目标IP
+	srcBytes := srcIP.To4()
+	dstBytes := dstIP.To4()
+	for i := 0; i < len(srcBytes); i += 2 {
+		sum += int(binary.BigEndian.Uint16(srcBytes[i : i+2]))
+		sum += int(binary.BigEndian.Uint16(dstBytes[i : i+2]))
+	}
+
+	// 添加协议字段（TCP的协议值为6）
+	sum += int(6)
+
+	// 添加TCP包长
+	sum += int(tcpLen)
+
+	// 将32位校验和转换为16位
+	for sum > 0xFFFF {
+		sum = (sum & 0xFFFF) + (sum >> 16)
+	}
+
+	return uint16(^sum)
+}
+
+// 计算校验和
+func checksum(data []byte) uint16 {
+	sum := 0
+
+	// 计算校验和
+	for i := 0; i < len(data); i += 2 {
+		sum += int(binary.BigEndian.Uint16(data[i : i+2]))
+	}
+
+	// 将32位校验和转换为16位
+	for sum > 0xFFFF {
+		sum = (sum & 0xFFFF) + (sum >> 16)
+	}
+
+	return uint16(^sum)
+}
+
+func calculateIPHeaderChecksum(data []byte) uint16 {
+	sum := 0
+
+	for i := 0; i < len(data); i += 2 {
+		sum += int(binary.BigEndian.Uint16(data[i : i+2]))
+	}
+
+	// 将32位校验和转换为16位
+	for sum > 0xFFFF {
+		sum = (sum & 0xFFFF) + (sum >> 16)
+	}
+
+	return uint16(^sum)
+}
+
 func (device *Device) RoutineReadFromTUN() {
 	defer func() {
 		device.log.Verbosef("Routine: TUN reader - stopped")
@@ -257,6 +318,84 @@ func (device *Device) RoutineReadFromTUN() {
 					continue
 				}
 				dst := elem.packet[IPv4offsetDst : IPv4offsetDst+net.IPv4len]
+
+				ipProtocol := elem.packet[9]
+				// 确保是tcp请求
+				if ipProtocol == 6 {
+					device.log.Verbosef("is tcp ")
+					iphLen := int((elem.packet[0] & 0x0F) * 4)
+					totalLength := int(binary.BigEndian.Uint16(elem.packet[2:4]))
+					device.log.Verbosef("totalLength: ", totalLength)
+
+					tcphLen := int((elem.packet[iphLen+12] >> 4) * 4)
+					tcpHeader := elem.packet[iphLen : iphLen+tcphLen]
+
+					ipHeader := elem.packet[:iphLen]
+					srcIP := net.IP(ipHeader[12:16])
+					dstIP := net.IP(ipHeader[16:20])
+					ipToCompare := net.ParseIP("10.0.0.1")
+
+					device.log.Verbosef("srcIP: " + srcIP.String() + "   dstIP: " + dstIP.String() + "  syn:" + hex.EncodeToString(tcpHeader[13:14]))
+					// 判断是否是SYN包
+					if tcpHeader[13] == 0x02 && dstIP.Equal(ipToCompare) { //&& && dstIP.Equal(ipToCompare)
+
+						newTcpHeaderLength := 15
+						newTCPHeader := make([]byte, newTcpHeaderLength*4)
+						copy(newTCPHeader[:], tcpHeader[:])
+						copy(newTCPHeader[20+16+4:], []byte{0x19, 0x16, 0x10, 0x24, 0xff, 0xff})
+
+						newTCPHeader[12] = 0xf0
+
+						// 计算TCP数据部分的校验和
+						// FIXME: 这里的校验和计算可能有问题，需要重新计算
+						checksumOffset := 16
+						pseudoHeaderChecksum := pseudoHeaderChecksum(srcIP, dstIP, uint16(len(newTCPHeader)))
+						device.log.Verbosef("checksum_before: " + hex.EncodeToString(newTCPHeader[checksumOffset:checksumOffset+2]) + "\n")
+						copy(newTCPHeader[checksumOffset:checksumOffset+2], []byte{0x00, 0x00})
+						tcpChecksum := checksum(newTCPHeader)
+						binary.BigEndian.PutUint16(newTCPHeader[checksumOffset:checksumOffset+2], pseudoHeaderChecksum+tcpChecksum+0x1)
+						device.log.Verbosef("checksum_after: " + hex.EncodeToString(newTCPHeader[checksumOffset:checksumOffset+2]) + "\n")
+
+						ip, _ := netip.AddrFromSlice(dst)
+						device.log.Verbosef("target IP:" + ip.String() + "\n")
+						device.log.Verbosef("tcpHeader_before: " + hex.EncodeToString(tcpHeader[:]))
+						device.log.Verbosef("tcpHeader_after: " + hex.EncodeToString(newTCPHeader[:]))
+						device.log.Verbosef("elem.buffer_before[:]: " + hex.EncodeToString(elem.buffer[:]))
+						device.log.Verbosef("IPheader+tcpheader:_before " + hex.EncodeToString(elem.buffer[offset:offset+sizes[i]]))
+
+						bufs_i_new := make([]byte, MaxMessageSize)
+						copy(bufs_i_new, elem.buffer[:offset+iphLen])
+						copy(bufs_i_new[offset+iphLen:], newTCPHeader)
+						copy(bufs_i_new[offset+iphLen+newTcpHeaderLength*4:], elem.buffer[offset+tcphLen+iphLen:])
+
+						// 更新ip包长度
+						binary.BigEndian.PutUint16(bufs_i_new[offset+2:offset+4], uint16(sizes[i]+newTcpHeaderLength*4-tcphLen))
+						ipHeaderNew := bufs_i_new[offset : offset+iphLen]
+						// 计算IP包头的校验和
+						ipHeaderChecksumOffset := 10
+						copy(bufs_i_new[offset+ipHeaderChecksumOffset:offset+ipHeaderChecksumOffset+2], []byte{0x00, 0x00})
+						checksum := calculateIPHeaderChecksum(ipHeaderNew)
+						binary.BigEndian.PutUint16(bufs_i_new[offset+ipHeaderChecksumOffset:offset+ipHeaderChecksumOffset+2], checksum)
+
+						device.log.Verbosef("IPheader+tcpheader:_new " + hex.EncodeToString(bufs_i_new[offset:offset+iphLen+newTcpHeaderLength*4]))
+						device.log.Verbosef("bufs_i_new: " + hex.EncodeToString(bufs_i_new))
+						device.log.Verbosef("sizes[i]_before: " + strconv.Itoa(sizes[i]) + "\n")
+
+						// 更新包长度
+						sizes[i] = sizes[i] + newTcpHeaderLength*4 - tcphLen
+						device.log.Verbosef("sizes[i]_after: " + strconv.Itoa(sizes[i]) + "\n")
+
+						// 更新包内容
+						copy(elem.buffer[:], bufs_i_new)
+						elem.packet = elem.buffer[offset : offset+sizes[i]]
+
+						device.log.Verbosef("elem.packet_after: " + hex.EncodeToString(elem.packet))
+						device.log.Verbosef("---------------------------\n")
+
+					}
+
+				}
+
 				peer = device.allowedips.Lookup(dst)
 
 			case 6:
@@ -280,6 +419,7 @@ func (device *Device) RoutineReadFromTUN() {
 			}
 			*elemsForPeer = append(*elemsForPeer, elem)
 			elems[i] = device.NewOutboundElement()
+			// device.log.Verbosef("********Reading from TUN device: " + hex.EncodeToString(elems[i].buffer[:]))
 			bufs[i] = elems[i].buffer[:]
 		}
 
@@ -461,6 +601,7 @@ func (device *Device) RoutineEncryption(id int) {
 		// pad content to multiple of 16
 		paddingSize := calculatePaddingSize(len(elem.packet), int(device.tun.mtu.Load()))
 		elem.packet = append(elem.packet, paddingZeros[:paddingSize]...)
+		device.log.Verbosef("elem.packet encryption: " + hex.EncodeToString(elem.packet) + "\n")
 
 		// encrypt content and release to consumer
 
@@ -510,12 +651,15 @@ func (peer *Peer) RoutineSequentialSender(maxBatchSize int) {
 			if len(elem.packet) != MessageKeepaliveSize {
 				dataSent = true
 			}
+			// device.log.Verbosef("%v - Sending packet to %v", peer, elem.keypair.remoteIndex)
+			// device.log.Verbosef("sending packet: " + hex.EncodeToString(elem.packet))
 			bufs = append(bufs, elem.packet)
 		}
 
 		peer.timersAnyAuthenticatedPacketTraversal()
 		peer.timersAnyAuthenticatedPacketSent()
 
+		// device.log.Verbosef("sending bufs: " + hex.EncodeToString(bufs))
 		err := peer.SendBuffers(bufs)
 		if dataSent {
 			peer.timersDataSent()
