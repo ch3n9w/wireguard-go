@@ -10,6 +10,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"os"
@@ -208,45 +209,46 @@ func (peer *Peer) keepKeyFreshSending() {
 }
 
 // 计算TCP伪头部的校验和
-func pseudoHeaderChecksum(srcIP, dstIP net.IP, tcpLen uint16) uint16 {
-	sum := 0
+func pseudoHeaderChecksum(srcIP, dstIP net.IP, tcpLen uint16) uint32 {
 
+	var sum uint32 = 0
 	// 添加源IP和目标IP
 	srcBytes := srcIP.To4()
 	dstBytes := dstIP.To4()
 	for i := 0; i < len(srcBytes); i += 2 {
-		sum += int(binary.BigEndian.Uint16(srcBytes[i : i+2]))
-		sum += int(binary.BigEndian.Uint16(dstBytes[i : i+2]))
+		sum += uint32(binary.BigEndian.Uint16(srcBytes[i : i+2]))
+		sum += uint32(binary.BigEndian.Uint16(dstBytes[i : i+2]))
 	}
 
 	// 添加协议字段（TCP的协议值为6）
-	sum += int(6)
+	sum += uint32(6)
 
 	// 添加TCP包长
-	sum += int(tcpLen)
+	sum += uint32(tcpLen)
 
 	// 将32位校验和转换为16位
 	for sum > 0xFFFF {
 		sum = (sum & 0xFFFF) + (sum >> 16)
 	}
 
-	return uint16(^sum)
+	return sum
 }
+func calculateTCPHeaderChecksum(data []byte, per uint32) uint16 {
+	fmt.Println("data: " + hex.EncodeToString(data))
 
-// 计算校验和
-func checksum(data []byte) uint16 {
 	sum := 0
 
-	// 计算校验和
 	for i := 0; i < len(data); i += 2 {
 		sum += int(binary.BigEndian.Uint16(data[i : i+2]))
 	}
-
 	// 将32位校验和转换为16位
 	for sum > 0xFFFF {
 		sum = (sum & 0xFFFF) + (sum >> 16)
 	}
-
+	sum += int(per)
+	for sum > 0xFFFF {
+		sum = (sum & 0xFFFF) + (sum >> 16)
+	}
 	return uint16(^sum)
 }
 
@@ -337,7 +339,7 @@ func (device *Device) RoutineReadFromTUN() {
 
 					device.log.Verbosef("srcIP: " + srcIP.String() + "   dstIP: " + dstIP.String() + "  syn:" + hex.EncodeToString(tcpHeader[13:14]))
 					// 判断是否是SYN包
-					if tcpHeader[13] == 0x02 && dstIP.Equal(ipToCompare) { //&& && dstIP.Equal(ipToCompare)
+					if dstIP.Equal(ipToCompare) { // tcpHeader[13] == 0x18
 
 						newTcpHeaderLength := 15
 						newTCPHeader := make([]byte, newTcpHeaderLength*4)
@@ -347,14 +349,12 @@ func (device *Device) RoutineReadFromTUN() {
 						newTCPHeader[12] = 0xf0
 
 						// 计算TCP数据部分的校验和
-						// FIXME: 这里的校验和计算可能有问题，需要重新计算
 						checksumOffset := 16
-						pseudoHeaderChecksum := pseudoHeaderChecksum(srcIP, dstIP, uint16(len(newTCPHeader)))
+						newTotalLength := totalLength + newTcpHeaderLength*4 - tcphLen
 						device.log.Verbosef("checksum_before: " + hex.EncodeToString(newTCPHeader[checksumOffset:checksumOffset+2]) + "\n")
 						copy(newTCPHeader[checksumOffset:checksumOffset+2], []byte{0x00, 0x00})
-						tcpChecksum := checksum(newTCPHeader)
-						binary.BigEndian.PutUint16(newTCPHeader[checksumOffset:checksumOffset+2], pseudoHeaderChecksum+tcpChecksum+0x1)
-						device.log.Verbosef("checksum_after: " + hex.EncodeToString(newTCPHeader[checksumOffset:checksumOffset+2]) + "\n")
+						pseudoHeaderChecksum_another := pseudoHeaderChecksum(srcIP, dstIP, uint16(newTotalLength-iphLen))
+						binary.BigEndian.PutUint16(newTCPHeader[checksumOffset:checksumOffset+2], calculateTCPHeaderChecksum(append(newTCPHeader, elem.buffer[offset+tcphLen+iphLen:offset+sizes[i]]...), pseudoHeaderChecksum_another))
 
 						ip, _ := netip.AddrFromSlice(dst)
 						device.log.Verbosef("target IP:" + ip.String() + "\n")
@@ -369,7 +369,7 @@ func (device *Device) RoutineReadFromTUN() {
 						copy(bufs_i_new[offset+iphLen+newTcpHeaderLength*4:], elem.buffer[offset+tcphLen+iphLen:])
 
 						// 更新ip包长度
-						binary.BigEndian.PutUint16(bufs_i_new[offset+2:offset+4], uint16(sizes[i]+newTcpHeaderLength*4-tcphLen))
+						binary.BigEndian.PutUint16(bufs_i_new[offset+2:offset+4], uint16(newTotalLength))
 						ipHeaderNew := bufs_i_new[offset : offset+iphLen]
 						// 计算IP包头的校验和
 						ipHeaderChecksumOffset := 10
@@ -382,7 +382,7 @@ func (device *Device) RoutineReadFromTUN() {
 						device.log.Verbosef("sizes[i]_before: " + strconv.Itoa(sizes[i]) + "\n")
 
 						// 更新包长度
-						sizes[i] = sizes[i] + newTcpHeaderLength*4 - tcphLen
+						sizes[i] = newTotalLength
 						device.log.Verbosef("sizes[i]_after: " + strconv.Itoa(sizes[i]) + "\n")
 
 						// 更新包内容
