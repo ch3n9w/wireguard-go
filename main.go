@@ -14,8 +14,10 @@ import (
 	"runtime"
 	"strconv"
 
+	"github.com/gin-gonic/gin"
 	"golang.org/x/sys/unix"
 	"golang.zx2c4.com/wireguard/conn"
+	"golang.zx2c4.com/wireguard/controller"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/ipc"
 	"golang.zx2c4.com/wireguard/tun"
@@ -98,15 +100,15 @@ func main() {
 	// get log level (default: info)
 
 	logLevel := func() int {
-		switch os.Getenv("LOG_LEVEL") {
-		case "verbose", "debug":
-			return device.LogLevelVerbose
-		case "error":
-			return device.LogLevelError
-		case "silent":
-			return device.LogLevelSilent
-		}
-		return device.LogLevelError
+		// switch os.Getenv("LOG_LEVEL") {
+		// case "verbose", "debug":
+		// 	return device.LogLevelVerbose
+		// case "error":
+		// 	return device.LogLevelError
+		// case "silent":
+		// 	return device.LogLevelSilent
+		// }
+		return device.LogLevelVerbose
 	}()
 
 	// open TUN device (or use supplied fd)
@@ -247,6 +249,16 @@ func main() {
 	}()
 
 	logger.Verbosef("UAPI listener started")
+
+	r := gin.Default()
+	r.GET("/ping", func(c *gin.Context) {
+		block := controller.GetBlock()
+		block.SetBlock(!block.GetBlock())
+		c.JSON(200, gin.H{
+			"message": "pong:" + strconv.FormatBool(block.GetBlock()),
+		})
+	})
+	r.Run()
 
 	// wait for program to terminate
 
