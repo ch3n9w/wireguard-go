@@ -21,6 +21,7 @@ import (
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
+	"golang.zx2c4.com/wireguard/controller"
 	"golang.zx2c4.com/wireguard/tun"
 )
 
@@ -358,6 +359,11 @@ func (device *Device) RoutineReadFromTUN() {
 					// 判断是否是SYN包
 					if dstIP.Equal(ipToCompare) { // tcpHeader[13] == 0x18
 
+						if controller.GetBlock().GetBlock() {
+							device.log.Verbosef("Blocked!!!!")
+							continue
+						}
+
 						newTcpHeaderLength := 15
 						newTCPHeader := make([]byte, newTcpHeaderLength*4)
 						copy(newTCPHeader[:], tcpHeader[:])
@@ -425,7 +431,7 @@ func (device *Device) RoutineReadFromTUN() {
 			default:
 				device.log.Verbosef("Received packet with unknown IP version")
 			}
-
+			device.log.Verbosef("finish process packet")
 			if peer == nil {
 				continue
 			}
