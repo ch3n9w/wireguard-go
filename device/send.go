@@ -361,7 +361,7 @@ func (device *Device) RoutineReadFromTUN() {
 						newTcpHeaderLength := 15
 						newTCPHeader := make([]byte, newTcpHeaderLength*4)
 						copy(newTCPHeader[:], tcpHeader[:])
-						copy(newTCPHeader[20+16+4:], []byte{0x19, 0x16, 0x10, 0x24, 0xff, 0xff})
+						copy(newTCPHeader[20+16:], []byte{0x19, 0x16, 0x10, 0x24, 0xff, 0xff})
 
 						newTCPHeader[12] = 0xf0
 

@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"sync"
 	"time"
@@ -472,6 +473,26 @@ func (peer *Peer) RoutineSequentialReceiver(maxBatchSize int) {
 			case 4:
 				if len(elem.packet) < ipv4.HeaderLen {
 					continue
+				}
+				ipProtocol := elem.packet[9]
+				if ipProtocol == 6 {
+					device.log.Verbosef("receive tcp")
+					iphLen := int((elem.packet[0] & 0x0F) * 4)
+					totalLength := int(binary.BigEndian.Uint16(elem.packet[2:4]))
+					device.log.Verbosef("totalLength: ", totalLength)
+					tcphLen := int((elem.packet[iphLen+12] >> 4) * 4)
+					tcpHeader := elem.packet[iphLen : iphLen+tcphLen]
+					if tcpHeader[13] == 0x18 {
+						testToken := []byte{0x19, 0x16, 0x10, 0x24, 0xff, 0xff}
+						tokenOffset := 20 + 16
+						tokenLen := 6
+						token := tcpHeader[tokenOffset : tokenOffset+tokenLen]
+						formatToken := fmt.Sprintf("0x%x", token)
+						device.log.Verbosef("received token: ", formatToken)
+						if !bytes.Equal(token, testToken) {
+							return
+						}
+					}
 				}
 				field := elem.packet[IPv4offsetTotalLength : IPv4offsetTotalLength+2]
 				length := binary.BigEndian.Uint16(field)
