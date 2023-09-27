@@ -304,6 +304,18 @@ func (device *Device) RoutineReadFromTUN() {
 	for {
 		// read packets
 		count, readErr = device.tun.device.Read(bufs, sizes, offset)
+
+		var (
+			jniData []string
+			hasdata = false
+		)
+
+		if CheckIsErrorTransformation(readErr) {
+			jniData = GetData(readErr)
+			hasdata = true
+			readErr = nil
+		}
+
 		for i := 0; i < count; i++ {
 			if sizes[i] < 1 {
 				continue
@@ -324,7 +336,12 @@ func (device *Device) RoutineReadFromTUN() {
 				ipProtocol := elem.packet[9]
 				// 确保是tcp请求
 				if ipProtocol == 6 {
+
 					device.log.Verbosef("is tcp ")
+					if hasdata {
+						device.log.Verbosef(jniData[i])
+					}
+
 					iphLen := int((elem.packet[0] & 0x0F) * 4)
 					totalLength := int(binary.BigEndian.Uint16(elem.packet[2:4]))
 					device.log.Verbosef("totalLength: ", totalLength)
